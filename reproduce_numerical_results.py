@@ -1,0 +1,387 @@
+# %% [markdown]
+# # Between Roots and Future: reproduction of the numerical results
+# This notebook reproduces the numerical values reported in the paper and in the Supplementary Material
+# (equilibria, eigenvalues, thresholds, tables, numerical check of global convergence).
+# Each check prints the value reported in the paper, the computed value, and `OK` if they agree
+# up to the rounding used in the text, `MISMATCH` otherwise.
+#
+# Run the cells in order (*Runtime → Run all*). Total running time: a few minutes.
+# Only `numpy` and `scipy` are required.
+
+# %%
+import numpy as np, warnings
+from scipy.integrate import solve_ivp
+from scipy.optimize import fsolve, brentq
+warnings.filterwarnings('ignore')
+
+# ------------------------------ Model --------------------------------
+# State vector x = (x_N, x_DL, x_D, x_H): shares of Nostalgic, Disillusioned, Depressed and Hopeful.
+TYPES = ['N', 'DL', 'D', 'H']
+NAMES = ['Nostalgic (N)', 'Disillusioned (DL)', 'Depressed (D)', 'Hopeful (H)']
+
+# Payoff parameters (Table 1): common good multiplier m; probabilities p (Nostalgic) and q (Disillusioned)
+# of preserving when meeting a Depressed member; endowment c; investments b (regenerating) and a (preserving).
+PAY = dict(m=1.8, p=0.8, q=0.6, c=5.0, b=3.0, a=2.0)
+
+# Conversion rates, with the notation of the paper:
+#   kH   = kappa_H       Fading              H  -> N
+#   kN   = kappa_N       Spontaneous exit    N  -> DL
+#   kDH  = kappa_{D,H}   Rescue              D  -> H
+#   kD   = kappa_D       Spontaneous exit    D  -> DL
+#   kDLD = kappa_{DL,D}  Contagion           DL -> D
+#   kDLH = kappa_{DL,H}  Testimony           DL -> H
+BASE = dict(kH=0.15, kN=0.15, kDH=0.45, kD=0.05, kDLD=0.65, kDLH=0.30)          # baseline (Scenario D)
+SCEN = {'A': dict(kH=0.05, kN=0.15, kDH=0.20, kD=0.20, kDLD=0.21, kDLH=0.70),   # Thriving
+        'B': dict(kH=0.20, kN=0.10, kDH=0.05, kD=0.05, kDLD=0.60, kDLH=0.20),   # Deteriorating
+        'C': dict(kH=0.70, kN=0.00, kDH=0.05, kD=0.70, kDLD=0.05, kDLH=0.05),   # Stagnant
+        'D': dict(BASE)}                                                         # Baseline
+
+def rates(**changes):
+    """Baseline conversion rates with optional changes, e.g. rates(kDLH=0)."""
+    k = dict(BASE); k.update(changes)
+    return k
+
+def payoff(m=1.8, p=0.8, q=0.6, c=5.0, b=3.0, a=2.0):
+    """Payoff matrix: entry (i, j) is the payoff of type i meeting type j (Section 3.2)."""
+    al, be = m/2 - 1, m/2                                                   # alpha, beta
+    return np.array([[c+(al+be)*a, c+(al+be)*a, c+al*a*p, c+al*a+be*b],     # N
+                     [c+(al+be)*a, c+(al+be)*a, c+al*a*q, c+al*a+be*b],     # DL
+                     [c+be*p*a,    c+be*q*a,    c,        c+be*b],          # D
+                     [c+al*b+be*a, c+al*b+be*a, c+al*b,   c+(al+be)*b]])    # H
+
+def rhs(t, x, M, w, k):
+    """Right-hand side of the system of Section 3.4: replicator term w*x_i*E_i(x) plus conversion flows."""
+    N, DL, D, H = x
+    f = M @ x; E = f - f @ x                                                # excess payoffs E_i = f_i - phi
+    return np.array([w*N*E[0]  - k['kN']*N + k['kH']*H,
+                     w*DL*E[1] + k['kN']*N + k['kD']*D - k['kDLD']*DL*D - k['kDLH']*DL*H,
+                     w*D*E[2]  + k['kDLD']*DL*D - k['kDH']*D*H - k['kD']*D,
+                     w*H*E[3]  + k['kDLH']*DL*H + k['kDH']*D*H - k['kH']*H])
+
+def CPI(x, pay=PAY):
+    """Community Preservation Index L (Section 3.2)."""
+    a, b, p, q = pay['a'], pay['b'], pay['p'], pay['q']
+    N, DL, D, H = x
+    return N*(1-(1-p)*D) + DL*(1-(1-q)*D) + (b/a)*H
+
+M0 = payoff(**PAY)                                                          # matrix M* of Table 1
+
+# ------------------------ Analysis helpers ---------------------------
+def longrun(k, w=1.0, M=M0, x0=(.25, .25, .25, .25), T=40000):
+    """State reached at time T (LSODA, rtol 1e-10, atol 1e-13)."""
+    s = solve_ivp(rhs, [0, T], x0, args=(M, w, k), method='LSODA', rtol=1e-10, atol=1e-13)
+    return np.clip(s.y[:, -1], 0, None)
+
+def jac_red(x, k, w=1.0, M=M0, h=1e-7):
+    """Jacobian in the coordinates (x_N, x_DL, x_H), with x_D = 1 - x_N - x_DL - x_H (as in the Supplementary).
+    Its eigenvalues are those of the Jacobian restricted to the tangent space of the simplex."""
+    def F(y):
+        z = np.array([y[0], y[1], 1-y.sum(), y[2]]); d = rhs(0, z, M, w, k); return d[[0, 1, 3]]
+    y0 = np.array([x[0], x[1], x[3]])
+    return np.array([(F(y0+h*e) - F(y0-h*e))/(2*h) for e in np.eye(3)]).T
+
+def eigenvalues(x, k, w=1.0, M=M0):
+    """Eigenvalues of the Jacobian restricted to the simplex, sorted by real and then imaginary part."""
+    ev = np.linalg.eigvals(jac_red(x, k, w, M))
+    return ev[np.lexsort((ev.imag, np.round(ev.real, 10)))]   # rounding keeps conjugate pairs in a fixed order
+
+def stable_eq(k, w=1.0, M=M0, n=60, seed=0):
+    """All locally stable equilibria in the simplex: Newton's method from n+6 starting points, then eigenvalues."""
+    rng = np.random.default_rng(seed); found = []
+    res = lambda y: rhs(0, np.append(y, 1-y.sum()), M, w, k)[:3]
+    starts = [rng.dirichlet(np.ones(4)*al) for al in (1, 0.3) for _ in range(n//2)]
+    starts += [np.array(v, float) for v in ([0,1,0,0], [0,.1,.9,0], [.1,.8,0,.1], [.3,.2,0,.5], [.25]*4, [0,.5,.5,0])]
+    for x0 in starts:
+        y, info, ier, msg = fsolve(res, x0[:3], full_output=True, xtol=1e-13)
+        x = np.append(y, 1-y.sum())
+        if ier == 1 and np.abs(rhs(0, x, M, w, k)).max() < 1e-10 and x.min() > -1e-9:
+            x = np.clip(x, 0, None)
+            if not any(np.abs(x-z).max() < 1e-5 for z in found): found.append(x)
+    return [x for x in found if eigenvalues(x, k, w, M).real.max() < -1e-7]
+
+def deltas(pay=PAY):
+    """Payoff differences delta_H, delta_D, gamma_D (Section 4.2)."""
+    a, b, m, q = pay['a'], pay['b'], pay['m'], pay['q']
+    al, be = m/2 - 1, m/2
+    return abs(al)*(b-a), a*((m-1)-be*q), abs(al)*a*q
+
+def Qstar(k, w=1.0, pay=PAY):
+    """Equilibrium Q* without Depressed (Proposition 1, closed form for x_H*)."""
+    u = w*deltas(pay)[0]; K = k['kDLH'] - u
+    A, B, C = u*K, -K*(k['kN']+u+k['kH']), k['kN']*K - k['kN']*k['kH']
+    h = -C/B if abs(A) < 1e-14 else (-B - np.sqrt(B*B - 4*A*C))/(2*A)
+    dl = (k['kH'] + u*(1-h))/k['kDLH']
+    return np.array([1-h-dl, dl, 0.0, h])
+
+def Fstar(k, w=1.0, pay=PAY):
+    """Equilibrium F* without Hopeful on the DL-D edge (Proposition 2, closed form for x_D*)."""
+    dH, dD, gD = deltas(pay); s = w*(dD+gD)
+    A, B, C = k['kDLD'] + w*gD, w*(2*dD+gD) - k['kDLD'], 4*s*k['kD']
+    d = (B + np.sqrt(A*A - C))/(2*s)
+    return np.array([0.0, 1-d, d, 0.0])
+
+def growth_D(x, k, w=1.0, M=M0):
+    """Per-capita growth rate of a small share of Depressed at state x (invasion condition)."""
+    f = M @ x; E = f - f @ x
+    return w*E[2] + k['kDLD']*x[1] - k['kDH']*x[3] - k['kD']
+
+def growth_H(x, k, w=1.0, M=M0):
+    """Per-capita growth rate of a small share of Hopeful at state x (invasion condition)."""
+    f = M @ x; E = f - f @ x
+    return w*E[3] + k['kDLH']*x[1] + k['kDH']*x[2] - k['kH']
+
+def check(name, paper, calc, tol):
+    paper, calc = np.atleast_1d(np.asarray(paper, float)), np.atleast_1d(np.asarray(calc, float))
+    ok = np.abs(paper - calc).max() <= tol
+    fmt = lambda v: ', '.join(f'{u:.4f}' for u in v)
+    print(f"{'OK      ' if ok else 'MISMATCH'}  {name}: paper ({fmt(paper)})  |  computed ({fmt(calc)})")
+
+def verdict(ok, text):
+    print(f"{'OK      ' if ok else 'MISMATCH'}  {text}")
+
+def header(title):
+    print('\n' + '='*70 + '\n' + title + '\n' + '='*70)
+
+def grid(n=100):
+    """Regular grid on the simplex, used to compute maxima of functions on Delta^3."""
+    pts = [(i, j, l, n-i-j-l) for i in range(n+1) for j in range(n+1-i) for l in range(n+1-i-j)]
+    return np.array(pts, float)/n
+
+def Pm(m):
+    """Payoff parameters with multiplier m."""
+    P = dict(PAY); P['m'] = m; return P
+
+print('Model loaded.')
+
+# %% [markdown]
+# ## 1. Payoff structure (Lemma 1, payoff differences, selection-only dynamics)
+
+# %%
+header('1. Payoff structure (Lemma 1, payoff differences, selection-only dynamics)')
+
+check('Table 1 (matrix M*), by rows',
+      (6.6, 6.6, 4.84, 7.5, 6.6, 6.6, 4.88, 7.5, 6.44, 6.08, 5.00, 7.7, 6.5, 6.5, 4.70, 7.4), M0.ravel(), 5e-9)
+dH, dD, gD = deltas()
+check('delta_H', 0.10, dH, 5e-4); check('delta_D', 0.52, dD, 5e-4); check('gamma_D', 0.12, gD, 5e-4)
+check('m_q = 2/(2-q)', 1.43, 2/(2-PAY['q']), 5e-3); check('m_p = 2/(2-p)', 1.67, 2/(2-PAY['p']), 5e-3)
+check('pi(N,j) - pi(H,j) for j = N, DL, D, H', (0.10, 0.10, 0.14, 0.10), M0[0] - M0[3], 5e-4)
+check('pi(DL,j) - pi(H,j) for j = N, DL, D, H', (0.10, 0.10, 0.18, 0.10), M0[1] - M0[3], 5e-4)
+check('pi(DL,D) - pi(N,D)', 0.04, M0[1, 2] - M0[0, 2], 5e-4)
+check('pi(N,N) - pi(D,N) and pi(DL,DL) - pi(D,DL)', (0.16, 0.52), (M0[0, 0] - M0[2, 0], M0[1, 1] - M0[2, 1]), 5e-4)
+check('D dominates H iff m < 2b/(b+a(1-q))', 1.58, 2*PAY['b']/(PAY['b']+PAY['a']*(1-PAY['q'])), 5e-3)
+
+# Selection-only dynamics (all conversion rates zero): percentage of 3000 random initial conditions that
+# converge to the N-DL segment. The tolerance reflects the sampling error of 3000 draws. Takes about 1.5 minutes.
+ZERO = {key: 0.0 for key in BASE}
+def share_to_segment(m, n=3000, seed=1):
+    rng = np.random.default_rng(seed); M = payoff(**Pm(m)); hits = 0
+    for _ in range(n):
+        x = longrun(ZERO, M=M, x0=rng.dirichlet(np.ones(4)), T=6000)
+        hits += bool(x[2] < 1e-3 and x[3] < 1e-3)
+    return 100*hits/n
+check('selection only, m = 1.45: % of trajectories converging to the N-DL segment', 0.7, share_to_segment(1.45), 0.5)
+check('selection only, m = 1.80: % of trajectories converging to the N-DL segment', 86, share_to_segment(1.8), 1.5)
+
+# %% [markdown]
+# ## 2. Scenarios A–D (Figures 1–4) and closed-form equilibria of Propositions 1 and 2
+
+# %%
+header('2. Scenarios A–D (Figures 1–4) and closed-form equilibria of Propositions 1 and 2')
+
+fig = {'A': (0.3018, 0.1336, 0, 0.5646), 'B': (0, 0.0744, 0.9256, 0),
+       'C': (0.5184, 0.4816, 0, 0), 'D': (0.2523, 0.3411, 0.2383, 0.1683)}
+for s in 'ABCD':
+    check(f'Scenario {s}, long-run state from x_i(0)=0.25 (Figure)', fig[s], longrun(SCEN[s]), 6e-5)
+check('Scenario A, Q* from the closed form of Proposition 1', fig['A'], Qstar(SCEN['A']), 6e-5)
+check('Scenario B, F* from the closed form of Proposition 2', fig['B'], Fstar(SCEN['B']), 6e-5)
+# conversion only (w=0) vs coupled dynamics (w=1), with the CPI
+tab = {'A': ((0.23, 0.07, 0, 0.70, 1.35), (0.30, 0.13, 0, 0.56, 1.28)),
+       'B': ((0, 0.08, 0.92, 0, 0.05), (0, 0.07, 0.93, 0, 0.05)),
+       'C': ((0.51, 0.49, 0, 0, 1.00), (0.52, 0.48, 0, 0, 1.00)),
+       'D': ((0.29, 0.28, 0.15, 0.29, 0.97), (0.25, 0.34, 0.24, 0.17, 0.80))}
+for s in 'ABCD':
+    for w, row in ((0, tab[s][0]), (1, tab[s][1])):
+        x = longrun(SCEN[s], w=w); check(f'Scenario {s}, w={w}: shares and CPI', row, np.r_[x, CPI(x)], 6e-3)
+
+# %% [markdown]
+# ## 3. Baseline equilibria and eigenvalues (Table 4 and Supplementary), projections of Section 4.4
+# Eigenvalues are computed in the coordinates $(x_N, x_{DL}, x_H)$ with $x_D$ eliminated, as in the Supplementary.
+
+# %%
+header('3. Baseline equilibria and eigenvalues (Table 4), projections of Section 4.4')
+
+k = rates()
+Es = [x for x in stable_eq(k) if x.min() > 1e-3][0]
+P1, P2, P3 = np.array([0, 1, 0, 0.]), Qstar(k), Fstar(k)
+check('E*', (0.2523, 0.3411, 0.2383, 0.1683), Es, 6e-5)
+check('P2 (= Q* at the baseline)', (0.103, 0.801, 0, 0.096), P2, 6e-4)
+check('P3 (= F* at the baseline)', (0, 0.069, 0.931, 0), P3, 6e-4)
+def check_eig(name, paper, x):
+    paper = np.array(paper, complex); paper = paper[np.lexsort((paper.imag, np.round(paper.real, 10)))]
+    ev = eigenvalues(x, k)
+    check(name + ', real parts', paper.real, ev.real, 6e-5)
+    check(name + ', imaginary parts', paper.imag, ev.imag, 6e-5)
+check_eig('eigenvalues P1', [-0.15, 0.08, 0.05], P1)
+check_eig('eigenvalues P2', [-0.0798+0.0308j, -0.0798-0.0308j, 0.0233], P2)
+check_eig('eigenvalues P3', [-0.6349, -0.2579, 0.0445], P3)
+check_eig('eigenvalues E*', [-0.0738+0.0835j, -0.0738-0.0835j, -0.0271], Es)
+check('per-capita growth rate of D at P2', 0.023, growth_D(P2, k), 6e-4)
+check('per-capita growth rate of H at P3', 0.04, growth_H(P3, k), 6e-3)
+
+def proj(x, hidden, order):
+    """Projection pi_h (Section 4.4): composition among the three displayed types, in the given order."""
+    return np.array([x[i] for i in order]) / (1 - x[hidden])
+check('Case 2: pi_DL(E*) in the order (H, D, N)', (0.255, 0.362, 0.383), proj(Es, 1, [3, 2, 0]), 6e-4)
+check('Case 2: pi_DL(P2) in the order (H, D, N)', (0.483, 0, 0.517), proj(P2, 1, [3, 2, 0]), 6e-4)
+check('Case 2: share of DL at E*, P2, P3', (0.34, 0.80, 0.07), (Es[1], P2[1], P3[1]), 6e-3)
+check('Case 4: pi_N(P2) in the order (H, DL, D)', (0.107, 0.893, 0), proj(P2, 0, [3, 1, 2]), 6e-4)
+check('Case 4: pi_N(E*) in the order (H, DL, D)', (0.225, 0.456, 0.319), proj(Es, 0, [3, 1, 2]), 6e-4)
+check('Case 4: share of N at P2, E*', (0.10, 0.25), (P2[0], Es[0]), 6e-3)
+
+# %% [markdown]
+# ## 4. Numerical check of global convergence (baseline)
+# 1200 initial conditions drawn uniformly from the interior of the simplex, integrated up to $t=6000$.
+# Along each trajectory the shares must stay non-negative and sum to one. Takes about a minute.
+
+# %%
+header('4. Numerical check of global convergence (baseline)')
+
+rng = np.random.default_rng(42)
+dist, min_share, sum_err = [], [], []
+for _ in range(1200):
+    s = solve_ivp(rhs, [0, 6000], rng.dirichlet(np.ones(4)), args=(M0, 1.0, k), method='LSODA',
+                  rtol=1e-10, atol=1e-13, t_eval=np.linspace(0, 6000, 61))
+    dist.append(np.abs(s.y[:, -1] - Es).max()); min_share.append(s.y.min()); sum_err.append(np.abs(s.y.sum(0) - 1).max())
+verdict(max(dist) < 1e-4, f'maximum distance from E* at t=6000 over 1200 trajectories: {max(dist):.1e}')
+verdict(min(min_share) > -1e-12, f'smallest share along the trajectories: {min(min_share):.1e}')
+verdict(max(sum_err) < 1e-9, f'largest deviation of the sum of the shares from 1: {max(sum_err):.1e}')
+
+# %% [markdown]
+# ## 5. Conditions of the propositions in Scenarios A, B, C and at the baseline
+# Maxima over a grid on the simplex with step 0.01 (a finer grid gives the same values to two decimals).
+
+# %%
+header('5. Conditions of the propositions in Scenarios A, B, C and at the baseline')
+
+X = grid(100)
+def maxima(kk, w=1.0):
+    f = X @ M0.T; E = f - np.sum(X*f, 1)[:, None]; N, DL, D, H = X.T
+    g = w*E[:, 2] + kk['kDLD']*DL - kk['kDH']*H - kk['kD']        # condition (14): g < 0
+    h = w*E[:, 3] + kk['kDLH']*DL + kk['kDH']*D - kk['kH']        # condition (18): h < 0
+    kN_ = w*E[:, 0] - kk['kN']                                     # condition (20): k < 0
+    return g.max(), h.max(), kN_.max(), kN_[H == 0].max()
+gA, _, _, _ = maxima(SCEN['A']); check('Scenario A, max g (condition (14) < 0)', -0.10, gA, 6e-3)
+_, hB, kB_all, kB_face = maxima(SCEN['B'])
+check('Scenario B, max h (condition (18) < 0)', -0.067, hB, 6e-4)
+check('Scenario B, max k on the simplex (= 0 at the H vertex)', 0.0, kB_all, 1e-9)
+check('Scenario B, max k on the face x_H=0 (condition (20))', -0.01, kB_face, 6e-4)
+gC, hC, _, _ = maxima(SCEN['C'])
+check('Scenario C, max g', -0.45, gC, 6e-3); check('Scenario C, max h', -0.67, hC, 6e-3)
+_, _, _, kD_face = maxima(rates())
+check('baseline, max of w E_N - kN on the face x_H=0', -0.06, kD_face, 6e-4)
+# Proposition 3 (Scenario C, kappa_N = 0): the limit of x_N depends on the initial condition
+xs = [longrun(SCEN['C'], x0=rng.dirichlet(np.ones(4)), T=3000)[0] for _ in range(5)]
+print('Scenario C, x_N* from 5 random initial conditions:', np.round(xs, 3))
+
+# %% [markdown]
+# ## 6. Robustness and bifurcations (Section 4.3)
+
+# %%
+header('6. Robustness and bifurcations (Section 4.3)')
+
+check('D invades all-DL iff kDLD > kD + w dD', 0.57, k['kD'] + dD, 5e-3)
+check('H invades all-DL iff kDLH > kH + w dH', 0.25, k['kH'] + dH, 5e-3)
+diff = [brentq(lambda v: growth_D(Qstar(rates(kDLH=y)), rates(kDLH=y, kDLD=v)), 0, 3) - y for y in np.linspace(0.26, 1, 40)]
+check('boundary line kDLD - kDLH (mean)', 0.32, np.mean(diff), 5e-3)
+print(f'   (the difference ranges from {min(diff):.3f} to {max(diff):.3f}: "very good approximation")')
+bis = [v for v in np.round(np.arange(0.36, 0.60, 0.01), 2) if len(stable_eq(rates(kDLH=0, kDLD=v))) >= 2]
+check('multistability wedge at kDLH=0: lower end', 0.41, min(bis), 0.011)
+print(f'   (bistability for kDLD from {min(bis)} to {max(bis)}; D invades all-DL for kDLD > 0.57)')
+check('testimony threshold', 0.33, brentq(lambda v: growth_D(Qstar(rates(kDLH=v)), rates(kDLH=v)), 0.26, 1), 5e-3)
+check('contagion threshold', 0.62, brentq(lambda v: growth_D(Qstar(rates(kDLD=v)), rates(kDLD=v)), 0, 1), 5e-3)
+check('rescue threshold, lower', 0.40, brentq(lambda v: growth_H(Fstar(k), rates(kDH=v)), 0, 1), 5e-3)
+check('rescue threshold, upper', 0.69, brentq(lambda v: growth_D(Qstar(k), rates(kDH=v)), 0, 1), 5e-3)
+x = stable_eq(rates(kDLH=0)); check('x_D for kDLH=0', 0.68, x[0][2], 5e-3)
+check('m threshold, lower (H invades F*)', 1.77, brentq(lambda m: growth_H(Fstar(k, pay=Pm(m)), k, M=payoff(**Pm(m))), 1.6, 1.85), 5e-3)
+check('m threshold, upper (D invades Q*)', 1.81, brentq(lambda m: growth_D(Qstar(k, pay=Pm(m)), k, M=payoff(**Pm(m))), 1.75, 1.95), 5e-3)
+check('H invades all-DL iff m >', 1.70, brentq(lambda m: k['kDLH'] - k['kH'] - deltas(Pm(m))[0], 1.5, 1.99), 5e-3)
+check('D invades all-DL iff m <', 1.86, brentq(lambda m: k['kDLD'] - k['kD'] - deltas(Pm(m))[1], 1.5, 1.99), 5e-3)
+ms = np.linspace(1.02, 1.765, 40); Fm = [Fstar(k, pay=Pm(m)) for m in ms]
+verdict(min(x[2] for x in Fm) > 0.93 and max(CPI(x, Pm(m)) for x, m in zip(Fm, ms)) < 0.05
+        and max(growth_H(x, k, M=payoff(**Pm(m))) for x, m in zip(Fm, ms)) < 0,
+        'for m < 1.77 the attractor is F*: the Depressed exceed 93% and L < 0.05')
+n_st = {len(stable_eq(k, M=payoff(**Pm(m)))) for m in np.linspace(1.02, 1.98, 49)}
+verdict(n_st == {1}, 'a single stable equilibrium along the path in m (1.02 <= m <= 1.98)')
+# table: conversion rates switched off one at a time (Table 2)
+ko = {'none': (rates(), (0.25, 0.34, 0.24, 0.17, 0.80)), 'testimony': (rates(kDLH=0), (0.10, 0.11, 0.68, 0.11, 0.33)),
+      'contagion': (rates(kDLD=0), (0.10, 0.80, 0, 0.10, 1.05)), 'rescue': (rates(kDH=0), (0, 0.07, 0.93, 0, 0.04)),
+      'D exit': (rates(kD=0), (0, 0, 1, 0, 0.00)), 'N exit': (rates(kN=0), (0.89, 0.11, 0, 0, 1.00)),
+      'fading': (rates(kH=0), (0, 0, 0, 1, 1.50))}
+for name, (kk, row) in ko.items():
+    x = longrun(kk); check(f'switched off: {name}', row, np.r_[x, CPI(x)], 6e-3)
+# without spontaneous exit of the Depressed, the all-D state is non-hyperbolic at the baseline
+al = PAY['m']/2 - 1
+check('switched off D exit: eigenvalue of the all-D state in the direction of H, kDH - kH - w|alpha|b', 0.0,
+      k['kDH'] - k['kH'] - abs(al)*PAY['b'], 1e-12)
+check('switched off D exit, with kDH = 0.46: long-run share of D', 0.77, longrun(rates(kD=0, kDH=0.46))[2], 6e-3)
+# selection intensity
+check('baseline: D extinct from w =', 1.07, brentq(lambda w: growth_D(Qstar(k, w), k, w), 0.5, 1.4), 5e-3)
+check('baseline: H cannot invade F* from w =', 1.18, brentq(lambda w: growth_H(Fstar(k, w), k, w), 0.5, 1.5), 5e-3)
+check('baseline: w_H (H and N disappear)', 1.5, (k['kDLH'] - k['kH'])/dH, 1e-9)
+ws = np.round(np.arange(1.160, 1.1801, 0.0025), 4)
+first = next(w for w in ws if len(stable_eq(k, w, n=300)) >= 2)
+verdict(1.170 <= first <= 1.1725, f'baseline: fold (two stable equilibria) from w = {first}  (paper: w > 1.17)')
+kA, kBs = SCEN['A'], SCEN['B']
+check('Scenario A: x_H* = 0.5 at w =', 1.46, brentq(lambda w: Qstar(kA, w)[3] - 0.5, 1, 2), 5e-3)
+check('Scenario A: w_H', 6.5, (kA['kDLH'] - kA['kH'])/dH, 1e-9)
+check('Scenario B: w_D', 1.06, (kBs['kDLD'] - kBs['kD'])/dD, 5e-3)
+print('Scenario B, number of stable equilibria at w = 1.0, 1.1, 1.3:', [len(stable_eq(kBs, w)) for w in (1.0, 1.1, 1.3)],
+      '(expected: 1 below w_D, 2 above w_D: F* and all-DL)')
+for s in 'ABD':
+    n_st = {len(stable_eq(SCEN[s], w)) for w in np.linspace(0.05, 1, 20)}
+    verdict(n_st == {1}, f'claim (i), Scenario {s}: a single attractor for every w in (0,1]')
+# invariance under time rescaling
+x0 = rng.dirichlet(np.ones(4)); w = 1.7
+err = np.abs(longrun(k, w=w, x0=x0) - longrun({j: v/w for j, v in k.items()}, w=1, x0=x0)).max()
+verdict(err < 1e-6, f'(w, kappa) and (1, kappa/w) give the same long-run state (difference {err:.1e})')
+
+# %% [markdown]
+# ## 7. Reduced models ("Reduced models" paragraph of Section 4.3)
+# Without the Depressed or the Hopeful the dynamics is that of the invariant faces. Without the Nostalgic or the
+# Disillusioned a single preserving type P takes over all the conversion flows of the removed one and reacts to the
+# Depressed with probability r (r = q without the Nostalgic, r = p without the Disillusioned).
+
+# %%
+header('7. Reduced models')
+
+check('no Depressed (face x_D=0): CPI', 1.05, CPI(Qstar(k)), 5e-3)
+check('no Hopeful (face x_H=0): share of D', 0.93, Fstar(k)[2], 5e-3)
+check('no Hopeful (face x_H=0): CPI', 0.04, CPI(Fstar(k)), 5e-3)
+
+def rhs_reduced(t, x, M, w, k):
+    """Types (P, D, H): P is the single preserving type."""
+    P, D, H = x
+    f = M @ x; E = f - f @ x
+    return np.array([w*P*E[0] + k['kD']*D + k['kH']*H - k['kDLD']*P*D - k['kDLH']*P*H,
+                     w*D*E[1] + k['kDLD']*P*D - k['kDH']*D*H - k['kD']*D,
+                     w*H*E[2] + k['kDLH']*P*H + k['kDH']*D*H - k['kH']*H])
+
+def reduced(r, paper_x, paper_L, name):
+    M = payoff(**dict(PAY, q=r))[np.ix_([1, 2, 3], [1, 2, 3])]        # rows and columns (P, D, H)
+    run = lambda x0: solve_ivp(rhs_reduced, [0, 6000], x0, args=(M, 1.0, k), method='LSODA',
+                               rtol=1e-10, atol=1e-13).y[:, -1]
+    xe = run(np.full(3, 1/3))
+    L = xe[0]*(1-(1-r)*xe[1]) + PAY['b']/PAY['a']*xe[2]
+    check(f'{name}: interior equilibrium (P, D, H)', paper_x, xe, 6e-4)
+    check(f'{name}: CPI', paper_L, L, 6e-3)
+    rng2 = np.random.default_rng(7)
+    spread = max(np.abs(run(x0) - xe).max() for x0 in rng2.dirichlet(np.ones(3), size=200))
+    verdict(spread < 1e-6, f'{name}: 200 random initial conditions converge to it (max distance {spread:.1e})')
+reduced(PAY['q'], (0.625, 0.045, 0.330), 1.11, 'without the Nostalgic')
+reduced(PAY['p'], (0.114, 0.683, 0.203), 0.40, 'without the Disillusioned')
+
+# Additional checks
+P = dict(PAY); P['p'] = PAY['q']; x = longrun(k, M=payoff(**P))
+verdict(x[2] < 1e-6, f'N and DL with the same reaction (p = q): long-run x_D = {x[2]:.1e} (the Depressed disappear)')
+def gp(p): P = dict(PAY); P['p'] = p; return growth_D(Qstar(k, pay=P), k, M=payoff(**P))
+check('the Depressed invade Q* only if p >', 0.67, brentq(gp, 0.6, 0.8), 5e-3)
